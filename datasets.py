@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader, Subset, TensorDataset, random_split
 # from sklearn.model_selection import train_test_split
 
 class ImbalancedDataset:
-    def __init__(self, dataset_name="mnist", rho=0.01, batch_size=64, seed=42, train_num_negative=8000, test_num_positive=4000, test_num_negative=4000, val_ratio=0.2):
+    def __init__(self, dataset_name="mnist", rho=0.01, batch_size=64, seed=42, train_num_negative=8000, test_num_positive=4000, test_num_negative=4000, val_ratio=0.2, meta_ratio=0.1):
         """
         初始化数据集处理类
         :param dataset_name: 数据集名称 (e.g., "mnist", "cifar10")
@@ -17,6 +17,7 @@ class ImbalancedDataset:
         :param test_num_positive: 测试集中正类的样本数量
         :param test_num_negative: 测试集中负类的样本数量
         :param val_ratio: 验证集占训练集的比例
+        :param meta_ratio: 元数据集占训练集的比例（MW-Net算法需要）
         """
         self.dataset_name = dataset_name
         self.rho = rho
@@ -26,6 +27,7 @@ class ImbalancedDataset:
         self.test_num_positive = test_num_positive
         self.test_num_negative = test_num_negative
         self.val_ratio = val_ratio
+        self.meta_ratio = meta_ratio
         torch.manual_seed(seed)
         np.random.seed(seed)
         
@@ -332,14 +334,12 @@ class ImbalancedDataset:
 
     def _preprocess_data(self):
         """
-        核心预处理：降采样正类 + 重映射标签（0/1）+ 划分验证集
-        遵循论文（Section 4.3）：
-
+        核心预处理：降采样正类 + 重映射标签（0/1）+ 划分验证集和元数据集
+        遵循论文：
           - 正类（少数类）标签 -> 0
           - 负类（多数类）标签 -> 1
           - 正类样本数降至 rho * N（N=负类原始样本数）
-        测试集：
-          - 正类和负类样本数目相同，都等于self.test_num
+          - 元数据集需要正负类均衡
         """
         # 获取标签数据 - 处理不同数据集的标签格式
         if isinstance(self.train_data.targets, list):
@@ -359,25 +359,30 @@ class ImbalancedDataset:
         # 保存原始训练数据的引用
         original_train_data = self.train_data.data
         
-        # 计算训练集和验证集所需的样本数量
-        val_negative_count = int(self.val_ratio * self.train_num_negative)
-        train_negative_count = self.train_num_negative - val_negative_count
+        # 分离正/负类索引
+        positive_idx = np.where(np.isin(train_labels, self.positive_classes))[0]
+        negative_idx = np.where(np.isin(train_labels, self.negative_classes))[0]
         
+        # 计算训练集、验证集和元数据集所需的样本数量
+        val_negative_count = int(self.val_ratio * self.train_num_negative)
+        
+        # 确定元数据集的大小（正负类均衡）
+        meta_size_per_class = int(min(len(positive_idx), len(negative_idx)) * self.meta_ratio)
+        meta_size_per_class = min(meta_size_per_class, 1000)  # 限制最大数量
+        
+        # 计算最终训练集的大小
+        train_negative_count = self.train_num_negative - val_negative_count - meta_size_per_class
         train_positive_count = max(1, int(self.rho * train_negative_count))
         val_positive_count = max(1, int(self.rho * val_negative_count))
         
         print(f"目标样本数量 - 训练集: 正类={train_positive_count}, 负类={train_negative_count}")
         print(f"目标样本数量 - 验证集: 正类={val_positive_count}, 负类={val_negative_count}")
-        
-        # 分离正/负类索引
-        positive_idx = np.where(np.isin(train_labels, self.positive_classes))[0]
-        negative_idx = np.where(np.isin(train_labels, self.negative_classes))[0]
-        
-        # 采样训练集和验证集所需的总样本数
-        total_positive_needed = train_positive_count + val_positive_count
-        total_negative_needed = train_negative_count + val_negative_count
+        print(f"目标样本数量 - 元数据集: 正类={meta_size_per_class}, 负类={meta_size_per_class} (均衡)")
         
         # 检查样本数量是否足够
+        total_positive_needed = train_positive_count + val_positive_count + meta_size_per_class
+        total_negative_needed = train_negative_count + val_negative_count + meta_size_per_class
+        
         if len(positive_idx) < total_positive_needed:
             print(f"警告: 正类样本不足，需要{total_positive_needed}个，实际{len(positive_idx)}个，将进行有放回采样")
         if len(negative_idx) < total_negative_needed:
@@ -390,12 +395,14 @@ class ImbalancedDataset:
         sampled_positive_idx = np.random.choice(positive_idx, size=total_positive_needed, replace=pos_replace)
         sampled_negative_idx = np.random.choice(negative_idx, size=total_negative_needed, replace=neg_replace)
         
-        # 分配给训练集和验证集
+        # 分配给训练集、验证集和元数据集
         train_pos_idx = sampled_positive_idx[:train_positive_count]
-        val_pos_idx = sampled_positive_idx[train_positive_count:]
+        val_pos_idx = sampled_positive_idx[train_positive_count:train_positive_count+val_positive_count]
+        meta_pos_idx = sampled_positive_idx[train_positive_count+val_positive_count:]
         
         train_neg_idx = sampled_negative_idx[:train_negative_count]
-        val_neg_idx = sampled_negative_idx[train_negative_count:]
+        val_neg_idx = sampled_negative_idx[train_negative_count:train_negative_count+val_negative_count]
+        meta_neg_idx = sampled_negative_idx[train_negative_count+val_negative_count:]
         
         # 创建训练集
         train_indices = np.concatenate([train_pos_idx, train_neg_idx])
@@ -428,6 +435,22 @@ class ImbalancedDataset:
             val_data = torch.tensor(val_data)
         
         self.val_data = TensorDataset(val_data, torch.tensor(val_labels_remapped))
+        
+        # 创建元数据集（均衡）
+        meta_indices = np.concatenate([meta_pos_idx, meta_neg_idx])
+        np.random.shuffle(meta_indices)
+        
+        meta_data = original_train_data[meta_indices]
+        meta_labels_raw = train_labels[meta_indices]
+        meta_labels_remapped = np.where(
+            np.isin(meta_labels_raw, self.positive_classes), 0, 1
+        )
+        
+        # 确保元数据是torch张量
+        if not isinstance(meta_data, torch.Tensor):
+            meta_data = torch.tensor(meta_data)
+        
+        self.meta_data = TensorDataset(meta_data, torch.tensor(meta_labels_remapped))
         
         # 处理测试集（平衡采样，使两类数量相等）
         # 只选择正类和负类标签的数据
@@ -495,8 +518,8 @@ class ImbalancedDataset:
 
     def get_dataloaders(self):
         """
-        生成训练、验证和测试 DataLoader
-        :return: (train_loader, val_loader, test_loader)
+        生成训练、验证、元数据和测试 DataLoader
+        :return: (train_loader, val_loader, meta_loader, test_loader)
         """
         train_loader = DataLoader(
             self.train_data, batch_size=self.batch_size, shuffle=True
@@ -504,11 +527,14 @@ class ImbalancedDataset:
         val_loader = DataLoader(
             self.val_data, batch_size=self.batch_size, shuffle=False
         )
+        meta_loader = DataLoader(
+            self.meta_data, batch_size=self.batch_size, shuffle=True
+        )
         test_loader = DataLoader(
             self.test_data, batch_size=self.batch_size, shuffle=False
         )
-        return train_loader, val_loader, test_loader
-        
+        return train_loader, val_loader, meta_loader, test_loader
+
     def get_full_dataset(self):
         """
         直接返回完整的训练和测试数据集
@@ -529,12 +555,16 @@ class ImbalancedDataset:
         # 处理验证集 (TensorDataset 类型)
         val_labels = self.val_data.tensors[1].numpy()
         
+        # 处理元数据集 (TensorDataset 类型)
+        meta_labels = self.meta_data.tensors[1].numpy()
+        
         # 处理测试集 (TensorDataset 类型)
         test_labels = self.test_data.tensors[1].numpy()
         
         return {
             "train": np.bincount(train_labels),
             "val": np.bincount(val_labels),
+            "meta": np.bincount(meta_labels),
             "test": np.bincount(test_labels)
         }
 # Example usage:
