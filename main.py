@@ -29,6 +29,19 @@ def to_var(x, requires_grad=True):
         x = x.cuda()
     return torch.autograd.Variable(x, requires_grad=requires_grad)
 
+def adjust_learning_rate(optimizer, epoch):
+    """根据epoch调整学习率"""
+    lr = 0.1  # 初始学习率
+    if epoch >= 80:
+        lr = lr * 0.1
+    if epoch >= 90:
+        lr = lr * 0.1
+    
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    
+    return lr
+
 def train_mwnet(model, vnet, train_loader, meta_loader, val_loader, test_loader, config, dataset_obj=None):
     """
     使用MW-Net算法训练模型
@@ -50,14 +63,14 @@ def train_mwnet(model, vnet, train_loader, meta_loader, val_loader, test_loader,
     model.to(device)
     vnet.to(device)
     
-    # 定义优化器
+    # 定义优化器 - 使用论文中的参数
     optimizer_model = optim.SGD(model.parameters(), 
-                               lr=config['learning_rate'],
+                               lr=0.1,  # 初始学习率为0.1
                                momentum=0.9, 
                                weight_decay=5e-4)
     
     optimizer_vnet = optim.Adam(vnet.parameters(), 
-                              lr=0.001,
+                              lr=1e-5,  # 固定学习率为1e-5
                               weight_decay=1e-4)
     
     # 创建保存目录
@@ -66,11 +79,17 @@ def train_mwnet(model, vnet, train_loader, meta_loader, val_loader, test_loader,
     # 训练日志
     train_losses = []
     meta_losses = []
+    learning_rates = []
     
     print(f"开始使用MW-Net训练 {config['model_type']} 模型 - 数据集: {config['dataset_name']}, 不平衡率: {config['rho']}")
     
     # 训练循环
     for epoch in range(1, config['epochs'] + 1):
+        # 调整学习率
+        current_lr = adjust_learning_rate(optimizer_model, epoch)
+        learning_rates.append(current_lr)
+        print(f"当前学习率: {current_lr}")
+        
         model.train()
         vnet.train()
         
@@ -125,8 +144,8 @@ def train_mwnet(model, vnet, train_loader, meta_loader, val_loader, test_loader,
             meta_model.zero_grad()
             grads = torch.autograd.grad(loss, meta_model.parameters(), create_graph=True)
             
-            # 步骤6: 进行虚拟更新
-            meta_lr = config['learning_rate']
+            # 步骤6: 进行虚拟更新 - 使用当前的学习率
+            meta_lr = current_lr
             meta_model_update = meta_model
             for i, (name, param) in enumerate(meta_model.named_parameters()):
                 if param.requires_grad:
@@ -180,7 +199,8 @@ def train_mwnet(model, vnet, train_loader, meta_loader, val_loader, test_loader,
             # 更新进度条
             progress_bar.set_postfix({
                 'loss': train_loss / (batch_idx + 1),
-                'meta_loss': meta_loss / (batch_idx + 1)
+                'meta_loss': meta_loss / (batch_idx + 1),
+                'lr': current_lr
             })
         
         # 计算epoch平均损失
@@ -189,7 +209,7 @@ def train_mwnet(model, vnet, train_loader, meta_loader, val_loader, test_loader,
         train_losses.append(epoch_loss)
         meta_losses.append(epoch_meta_loss)
         
-        print(f"Epoch {epoch} - 训练损失: {epoch_loss:.4f}, 元损失: {epoch_meta_loss:.4f}")
+        print(f"Epoch {epoch} - 训练损失: {epoch_loss:.4f}, 元损失: {epoch_meta_loss:.4f}, 学习率: {current_lr:.6f}")
         
         # 在验证集上评估
         print(f"\n===== 在验证集上评估 Epoch {epoch} =====")
@@ -247,7 +267,6 @@ def main():
     # 训练参数
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
     parser.add_argument('--eval_interval', type=int, default=5, help='测试集评估间隔(每多少个epoch评估一次)')
-    parser.add_argument('--lr', type=float, default=0.01, help='学习率')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--gpu', type=int, default=0, help='GPU ID，设为-1表示使用CPU')
     
@@ -310,7 +329,6 @@ def main():
             'rho': args.rho,
             'batch_size': args.batch_size,
             'model_type': 'ResNet32_1d',
-            'learning_rate': args.lr,
             'epochs': args.epochs,
             'eval_interval': args.eval_interval,
             'seed': args.seed,
@@ -368,4 +386,4 @@ def main():
 if __name__ == "__main__":
     main()
     
-#python main.py --dataset TBM_K_M_Noise --rho 0.01 --batch_size 64 --val_ratio 0.2 --meta_ratio 0.1 --epochs 100 --lr 0.01 --save_dir ./results
+#python main.py --dataset TBM_K_M_Noise --rho 0.01 --batch_size 64 --val_ratio 0.2 --meta_ratio 0.1 --epochs 100 --save_dir ./results
