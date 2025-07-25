@@ -69,8 +69,9 @@ def train_mwnet(model, vnet, train_loader, meta_loader, val_loader, test_loader,
                                momentum=0.9, 
                                weight_decay=5e-4)
     
+    # 使用vnet.parameters()而不是vnet.params()
     optimizer_vnet = optim.Adam(vnet.parameters(), 
-                              lr=1e-5,  # 固定学习率为1e-5
+                              lr=1e-3,  # 调整为MW-Net原始实现中的学习率
                               weight_decay=1e-4)
     
     # 创建保存目录
@@ -122,36 +123,36 @@ def train_mwnet(model, vnet, train_loader, meta_loader, val_loader, test_loader,
             
             targets = targets.to(device)
             
-            # 步骤1: 创建临时模型，拷贝当前模型参数
+            # 步骤1: 创建元模型并加载当前模型的状态
             meta_model = ResNet32_1d(input_channels=config['input_channels'], 
                                     seq_length=config['seq_length'], 
                                     num_classes=2).to(device)
             meta_model.load_state_dict(model.state_dict())
             
-            # 步骤2: 计算每个样本的损失
+            # 步骤2: 使用元模型计算输出
             outputs = meta_model(inputs)
+            
+            # 步骤3: 计算每个样本的损失
             cost = F.cross_entropy(outputs, targets, reduction='none')
             cost_v = cost.view(-1, 1)
             
-            # 步骤3: 使用vnet计算样本权重
-            with torch.no_grad():
-                w_org = vnet(cost_v)
+            # 步骤4: 使用vnet计算样本权重
+            v_lambda = vnet(cost_v.data)
             
-            # 步骤4: 使用权重计算加权损失
-            loss = torch.sum(cost_v * w_org) / len(cost_v)
+            # 步骤5: 使用权重计算加权损失
+            l_f_meta = torch.sum(cost_v * v_lambda) / len(cost_v)
             
-            # 步骤5: 计算元梯度
+            # 步骤6: 计算元梯度
             meta_model.zero_grad()
-            grads = torch.autograd.grad(loss, meta_model.parameters(), create_graph=True)
+            grads = torch.autograd.grad(l_f_meta, meta_model.parameters(), create_graph=True)
             
-            # 步骤6: 进行虚拟更新 - 使用当前的学习率
+            # 步骤7: 使用元梯度更新元模型参数
             meta_lr = current_lr
-            meta_model_update = meta_model
-            for i, (name, param) in enumerate(meta_model.named_parameters()):
-                if param.requires_grad:
-                    param.data = param.data - meta_lr * grads[i]
+            # 使用update_params方法替代手动更新
+            meta_model.update_params(lr_inner=meta_lr, source_params=grads)
+            del grads
             
-            # 步骤7: 在元数据集上计算损失
+            # 步骤8: 获取元数据集批次
             try:
                 meta_inputs, meta_targets = next(meta_loader_iter)
             except StopIteration:
@@ -174,32 +175,52 @@ def train_mwnet(model, vnet, train_loader, meta_loader, val_loader, test_loader,
             
             meta_targets = meta_targets.to(device)
             
-            # 使用更新后的元模型前向传播
-            meta_outputs = meta_model_update(meta_inputs)
-            meta_l = F.cross_entropy(meta_outputs, meta_targets)
+            # 步骤9: 使用更新后的元模型计算元数据集的损失
+            y_g_hat = meta_model(meta_inputs)
+            l_g_meta = F.cross_entropy(y_g_hat, meta_targets)
             
-            # 步骤8: 更新vnet参数
+            # 计算元数据集的准确率（用于显示）
+            with torch.no_grad():
+                _, predicted = y_g_hat.max(1)
+                prec_meta = 100. * predicted.eq(meta_targets).sum().item() / meta_targets.size(0)
+            
+            # 步骤10: 更新vnet参数
             optimizer_vnet.zero_grad()
-            meta_l.backward()
+            l_g_meta.backward()
             optimizer_vnet.step()
             
-            # 步骤9: 计算带有更新后vnet的损失
-            v_lambda = vnet(cost_v.detach())
-            l_f = torch.sum(cost_v.detach() * v_lambda) / len(cost_v)
+            # 步骤11: 使用主模型计算训练数据的输出
+            outputs = model(inputs)
+            cost_w = F.cross_entropy(outputs, targets, reduction='none')
+            cost_v = cost_w.view(-1, 1)
             
-            # 步骤10: 更新主模型参数
+            # 计算训练集的准确率（用于显示）
+            with torch.no_grad():
+                _, predicted = outputs.max(1)
+                prec_train = 100. * predicted.eq(targets).sum().item() / targets.size(0)
+            
+            # 步骤12: 使用更新后的vnet重新计算样本权重
+            with torch.no_grad():
+                w_new = vnet(cost_v)
+            
+            # 步骤13: 计算最终加权损失
+            loss = torch.sum(cost_v * w_new) / len(cost_v)
+            
+            # 步骤14: 更新主模型参数
             optimizer_model.zero_grad()
-            l_f.backward()
+            loss.backward()
             optimizer_model.step()
             
             # 记录损失
-            train_loss += l_f.item()
-            meta_loss += meta_l.item()
+            train_loss += loss.item()
+            meta_loss += l_g_meta.item()
             
             # 更新进度条
             progress_bar.set_postfix({
                 'loss': train_loss / (batch_idx + 1),
                 'meta_loss': meta_loss / (batch_idx + 1),
+                'train_acc': prec_train,
+                'meta_acc': prec_meta,
                 'lr': current_lr
             })
         
@@ -341,7 +362,7 @@ def main():
         
         # 创建模型
         model = ResNet32_1d(input_channels=input_channels, seq_length=seq_length, num_classes=2)
-        vnet = VNet(1, 100, 1)  # 输入维度为1，隐藏层100，输出维度为1
+        vnet = VNet(1, 100, 1).to(device)  # 确保VNet也移动到正确的设备上
         
         # 训练模型
         print("\n开始MW-Net训练过程...")
@@ -386,4 +407,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-#python /workspace/RL/Comparison-MW_net/main.py --dataset TBM_K_M_Noise --rho 0.01 --batch_size 64 --val_ratio 0.2 --meta_ratio 0.1 --epochs 100 --save_dir /workspace/RL/Comparison-MW_net/results
+# python /workspace/RL/Comparison-MW_net/main.py --dataset TBM_K_M_Noise --rho 0.01 --batch_size 64 --val_ratio 0.2 --meta_ratio 0.1 --epochs 100 --save_dir /workspace/RL/Comparison-MW_net/results

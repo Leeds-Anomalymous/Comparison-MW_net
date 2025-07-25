@@ -61,7 +61,7 @@ class ResNet(nn.Module):
         x = self.fc(x)
         return x
 
-def ResNet32_1d(input_channels=3, seq_length=32, num_classes=10):
+def ResNet32_1d(input_channels=3, seq_length=32, num_classes=2):
     """创建自定义的ResNet-32模型"""
     return ResNet(BasicBlock, [5, 5, 5], input_channels, seq_length, num_classes)    
 
