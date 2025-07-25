@@ -385,5 +385,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
-#python main.py --dataset TBM_K_M_Noise --rho 0.01 --batch_size 64 --val_ratio 0.2 --meta_ratio 0.1 --epochs 100 --save_dir ./results
+
+#python /workspace/RL/Comparison-MW_net/main.py --dataset TBM_K_M_Noise --rho 0.01 --batch_size 64 --val_ratio 0.2 --meta_ratio 0.1 --epochs 100 --save_dir /workspace/RL/Comparison-MW_net/results
