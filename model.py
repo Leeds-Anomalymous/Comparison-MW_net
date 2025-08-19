@@ -1,190 +1,16 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from torch.autograd import Variable
-import torch.nn.functional as F
-class BasicBlock(nn.Module):
-    expansion = 1
-
-    def __init__(self, in_channels, out_channels, stride=1):
-        super(BasicBlock, self).__init__()
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm1d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm1d(out_channels)
-            )
-
-    def forward(self, x):
-        identity = self.shortcut(x)
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += identity
-        return self.relu(out)
-
-class ResNet(nn.Module):
-    def __init__(self, block, num_blocks, input_channels=3, seq_length=32, num_classes=10):
-        super(ResNet, self).__init__()
-        self.in_channels = 16
-        self.conv1 = nn.Conv1d(input_channels, 16, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm1d(16)
-        self.relu = nn.ReLU(inplace=True)
-        self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
-        
-        self.seq_length = seq_length // 4 
-        self.avgpool = nn.AdaptiveAvgPool1d(self.seq_length)
-        self.fc = nn.Linear(64 * self.seq_length, num_classes)
-
-    def _make_layer(self, block, out_channels, num_blocks, stride):
-        strides = [stride] + [1] * (num_blocks - 1)
-        layers = []
-        for stride in strides:
-            layers.append(block(self.in_channels, out_channels, stride))
-            self.in_channels = out_channels
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-        return x
-
-def ResNet32_1d(input_channels=3, seq_length=32, num_classes=2):
-    """创建自定义的ResNet-32模型"""
-    return ResNet(BasicBlock, [5, 5, 5], input_channels, seq_length, num_classes)    
-
-
-class BiLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes):
-        super(BiLSTM, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        
-        # BiLSTM
-        self.lstm = nn.LSTM(
-            input_size, hidden_size, num_layers, 
-            batch_first=True, bidirectional=True
-        )
-        
-        # 全连接层
-        self.fc = nn.Linear(hidden_size * 2, num_classes)  # *2 因为双向
-        
-    def forward(self, x):
-        # 根据输入数据形状进行不同处理
-        if len(x.shape) == 4:  # 图像数据 (batch, 1, height, width)
-            # 移除通道维度，转为 (batch, height, width)
-            x = x.squeeze(1)
-        elif len(x.shape) == 3:  # TBM数据 (batch, channels, seq_length)
-            # 将形状从 (batch, channels, seq_length) 转换为 (batch, seq_length, channels)
-            x = x.permute(0, 2, 1)
-        
-        # 初始化隐藏状态
-        h0 = torch.zeros(self.num_layers * 2, x.size(0), self.hidden_size).to(x.device)
-        c0 = torch.zeros(self.num_layers * 2, x.size(0), self.hidden_size).to(x.device)
-        
-        # 前向传播BiLSTM
-        out, _ = self.lstm(x, (h0, c0))  # out: (batch_size, seq_length, hidden_size*2)
-        
-        # 取最后一个时间步的输出
-        out = self.fc(out[:, -1, :])
-        return out
-
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(1)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        x = x + self.pe[:x.size(0), :]
-        return self.dropout(x)
-
-
-class TransformerModel(nn.Module):
-    def __init__(self, input_dim, d_model, nhead, num_encoder_layers, dim_feedforward, seq_length, num_classes, dropout=0.1):
-        super(TransformerModel, self).__init__()
-        # 将输入特征映射到模型维度
-        self.embedding = nn.Linear(input_dim, d_model)
-        
-        # 位置编码
-        self.pos_encoder = PositionalEncoding(d_model, dropout, max_len=seq_length)
-        
-        # Transformer编码器层
-        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_encoder_layers)
-        
-        # 分类头
-        self.classifier = nn.Linear(d_model, num_classes)
-        
-        self.d_model = d_model
-        self.seq_length = seq_length
-        
-    def forward(self, x):
-        # x shape: [batch_size, channels, seq_length]
-        # 转换为Transformer期望的形状 [seq_length, batch_size, features]
-        x = x.permute(2, 0, 1)  # [seq_length, batch_size, channels]
-        
-        # 映射到模型维度
-        x = self.embedding(x)
-        
-        # 添加位置编码
-        x = self.pos_encoder(x)
-        
-        # 通过Transformer编码器
-        x = self.transformer_encoder(x)
-        
-        # 使用序列的平均值进行分类
-        x = x.mean(dim=0)  # [batch_size, d_model]
-        
-        # 分类层
-        x = self.classifier(x)
-        return x
-
-
-def create_transformer(input_dim=3, seq_length=32, num_classes=10):
-    """创建Transformer模型"""
-    d_model = 128  # 模型维度
-    nhead = 8  # 多头注意力的头数
-    num_encoder_layers = 6  # 编码器层数
-    dim_feedforward = 512  # 前馈网络维度
-    dropout = 0.1  # dropout率
-    
-    return TransformerModel(
-        input_dim=input_dim,
-        d_model=d_model,
-        nhead=nhead,
-        num_encoder_layers=num_encoder_layers,
-        dim_feedforward=dim_feedforward,
-        seq_length=seq_length,
-        num_classes=num_classes,
-        dropout=dropout
-    )
+import torch.nn.init as init
 
 
 def to_var(x, requires_grad=True):
     if torch.cuda.is_available():
         x = x.cuda()
     return Variable(x, requires_grad=requires_grad)
+
 
 class MetaModule(nn.Module):
     # adopted from: Adrien Ecoffet https://github.com/AdrienLE
@@ -243,6 +69,29 @@ class MetaModule(nn.Module):
                     param = param.detach_()  # https://blog.csdn.net/qq_39709535/article/details/81866686
                     self.set_param(self, name, param)
 
+    def set_param(self, curr_mod, name, param):
+        if '.' in name:
+            n = name.split('.')
+            module_name = n[0]
+            rest = '.'.join(n[1:])
+            for name, mod in curr_mod.named_children():
+                if module_name == name:
+                    self.set_param(mod, rest, param)
+                    break
+        else:
+            setattr(curr_mod, name, param)
+
+    def detach_params(self):
+        for name, param in self.named_params(self):
+            self.set_param(self, name, param.detach())
+
+    def copy(self, other, same_var=False):
+        for name, param in other.named_params():
+            if not same_var:
+                param = to_var(param.data.clone(), requires_grad=True)
+            self.set_param(name, param)
+
+
 class MetaLinear(MetaModule):
     def __init__(self, *args, **kwargs):
         super().__init__()
@@ -256,7 +105,173 @@ class MetaLinear(MetaModule):
 
     def named_leaves(self):
         return [('weight', self.weight), ('bias', self.bias)]
-    
+
+
+class MetaConv2d(MetaModule):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        ignore = nn.Conv2d(*args, **kwargs)
+
+        self.in_channels = ignore.in_channels
+        self.out_channels = ignore.out_channels
+        self.stride = ignore.stride
+        self.padding = ignore.padding
+        self.dilation = ignore.dilation
+        self.groups = ignore.groups
+        self.kernel_size = ignore.kernel_size
+
+        self.register_buffer('weight', to_var(ignore.weight.data, requires_grad=True))
+
+        if ignore.bias is not None:
+            self.register_buffer('bias', to_var(ignore.bias.data, requires_grad=True))
+        else:
+            self.register_buffer('bias', None)
+
+    def forward(self, x):
+        return F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+    def named_leaves(self):
+        return [('weight', self.weight), ('bias', self.bias)]
+
+
+class MetaConvTranspose2d(MetaModule):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        ignore = nn.ConvTranspose2d(*args, **kwargs)
+
+        self.stride = ignore.stride
+        self.padding = ignore.padding
+        self.dilation = ignore.dilation
+        self.groups = ignore.groups
+
+        self.register_buffer('weight', to_var(ignore.weight.data, requires_grad=True))
+
+        if ignore.bias is not None:
+            self.register_buffer('bias', to_var(ignore.bias.data, requires_grad=True))
+        else:
+            self.register_buffer('bias', None)
+
+    def forward(self, x, output_size=None):
+        output_padding = self._output_padding(x, output_size)
+        return F.conv_transpose2d(x, self.weight, self.bias, self.stride, self.padding,
+                                  output_padding, self.groups, self.dilation)
+
+    def named_leaves(self):
+        return [('weight', self.weight), ('bias', self.bias)]
+
+
+class MetaBatchNorm2d(MetaModule):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        ignore = nn.BatchNorm2d(*args, **kwargs)
+
+        self.num_features = ignore.num_features
+        self.eps = ignore.eps
+        self.momentum = ignore.momentum
+        self.affine = ignore.affine
+        self.track_running_stats = ignore.track_running_stats
+
+        if self.affine:
+            self.register_buffer('weight', to_var(ignore.weight.data, requires_grad=True))
+            self.register_buffer('bias', to_var(ignore.bias.data, requires_grad=True))
+
+        if self.track_running_stats:
+            self.register_buffer('running_mean', torch.zeros(self.num_features))
+            self.register_buffer('running_var', torch.ones(self.num_features))
+        else:
+            self.register_parameter('running_mean', None)
+            self.register_parameter('running_var', None)
+
+    def forward(self, x):
+        return F.batch_norm(x, self.running_mean, self.running_var, self.weight, self.bias,
+                            self.training or not self.track_running_stats, self.momentum, self.eps)
+
+    def named_leaves(self):
+        return [('weight', self.weight), ('bias', self.bias)]
+
+
+def _weights_init(m):
+    classname = m.__class__.__name__
+    # print(classname)
+    if isinstance(m, MetaLinear) or isinstance(m, MetaConv2d):
+        init.kaiming_normal_(m.weight)  # 修复弃用警告：使用kaiming_normal_替代kaiming_normal
+
+class LambdaLayer(MetaModule):
+    def __init__(self, lambd):
+        super(LambdaLayer, self).__init__()
+        self.lambd = lambd
+
+    def forward(self, x):
+        return self.lambd(x)
+
+
+class BasicBlock(MetaModule):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1, option='A'):
+        super(BasicBlock, self).__init__()
+        self.conv1 = MetaConv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = MetaBatchNorm2d(planes)
+        self.conv2 = MetaConv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = MetaBatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            if option == 'A':
+                """
+                For CIFAR10 ResNet paper uses option A.
+                """
+                self.shortcut = LambdaLayer(lambda x:
+                                            F.pad(x[:, :, ::2, ::2], (0, 0, 0, 0, planes//4, planes//4), "constant", 0))
+            elif option == 'B':
+                self.shortcut = nn.Sequential(
+                    MetaConv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                    MetaBatchNorm2d(self.expansion * planes)
+                )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class ResNet32(MetaModule):
+    def __init__(self, num_classes, block=BasicBlock, num_blocks=[5, 5, 5]):
+        super(ResNet32, self).__init__()
+        self.in_planes = 16
+
+        self.conv1 = MetaConv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = MetaBatchNorm2d(16)
+        self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
+        self.linear = MetaLinear(64, num_classes)
+
+        self.apply(_weights_init)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1]*(num_blocks-1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = F.avg_pool2d(out, out.size()[3])
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+
+
+
 class VNet(MetaModule):
     def __init__(self, input, hidden1, output):
         super(VNet, self).__init__()
@@ -272,3 +287,139 @@ class VNet(MetaModule):
         # x = self.relu1(x)
         out = self.linear2(x)
         return F.sigmoid(out)
+
+
+class MetaConv1d(MetaModule):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        ignore = nn.Conv1d(*args, **kwargs)
+
+        self.in_channels = ignore.in_channels
+        self.out_channels = ignore.out_channels
+        self.stride = ignore.stride
+        self.padding = ignore.padding
+        self.dilation = ignore.dilation
+        self.groups = ignore.groups
+        self.kernel_size = ignore.kernel_size
+
+        self.register_buffer('weight', to_var(ignore.weight.data, requires_grad=True))
+
+        if ignore.bias is not None:
+            self.register_buffer('bias', to_var(ignore.bias.data, requires_grad=True))
+        else:
+            self.register_buffer('bias', None)
+
+    def forward(self, x):
+        return F.conv1d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+    def named_leaves(self):
+        return [('weight', self.weight), ('bias', self.bias)]
+
+
+class MetaBatchNorm1d(MetaModule):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        ignore = nn.BatchNorm1d(*args, **kwargs)
+
+        self.num_features = ignore.num_features
+        self.eps = ignore.eps
+        self.momentum = ignore.momentum
+        self.affine = ignore.affine
+        self.track_running_stats = ignore.track_running_stats
+
+        if self.affine:
+            self.register_buffer('weight', to_var(ignore.weight.data, requires_grad=True))
+            self.register_buffer('bias', to_var(ignore.bias.data, requires_grad=True))
+
+        if self.track_running_stats:
+            self.register_buffer('running_mean', torch.zeros(self.num_features))
+            self.register_buffer('running_var', torch.ones(self.num_features))
+        else:
+            self.register_parameter('running_mean', None)
+            self.register_parameter('running_var', None)
+
+    def forward(self, x):
+        return F.batch_norm(x, self.running_mean, self.running_var, self.weight, self.bias,
+                            self.training or not self.track_running_stats, self.momentum, self.eps)
+
+    def named_leaves(self):
+        return [('weight', self.weight), ('bias', self.bias)]
+
+
+class BasicBlock1d(MetaModule):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1, option='A'):
+        super(BasicBlock1d, self).__init__()
+        self.conv1 = MetaConv1d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = MetaBatchNorm1d(planes)
+        self.conv2 = MetaConv1d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = MetaBatchNorm1d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            if option == 'A':
+                """
+                对于一维数据的 option A
+                """
+                self.shortcut = LambdaLayer(lambda x:
+                                            F.pad(x[:, :, ::2], (0, 0, planes//4, planes//4), "constant", 0))
+            elif option == 'B':
+                self.shortcut = nn.Sequential(
+                    MetaConv1d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                    MetaBatchNorm1d(self.expansion * planes)
+                )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class MetaResNet32_1d(MetaModule):
+    def __init__(self, input_channels, seq_length, num_classes, block=BasicBlock1d, num_blocks=[5, 5, 5]):
+        super(MetaResNet32_1d, self).__init__()
+        self.in_planes = 16
+
+        self.conv1 = MetaConv1d(input_channels, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = MetaBatchNorm1d(16)
+        self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
+        
+        # 计算最终序列长度（考虑stride缩减）
+        final_seq_length = seq_length // 4  # 两次stride=2将长度缩小4倍
+        
+        # 移除自适应平均池化
+        self.linear = MetaLinear(64, num_classes)
+
+        self.apply(_weights_init)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1]*(num_blocks-1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        # 使用 avg_pool1d 替代自适应池化，kernel_size 设为特征长度实现全局平均池化
+        out = F.avg_pool1d(out, kernel_size=out.size(2))
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+
+
+
+
+
+
+

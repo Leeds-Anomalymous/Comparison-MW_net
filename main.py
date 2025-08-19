@@ -6,12 +6,13 @@ import numpy as np
 import os
 import argparse
 import time
+import copy
 from datetime import datetime
 from tqdm import tqdm
 
 # 导入自定义模块
 from datasets import ImbalancedDataset
-from model import ResNet32_1d, VNet
+from model import VNet, MetaResNet32_1d
 from evaluate import evaluate_model
 
 def set_seed(seed):
@@ -31,7 +32,7 @@ def to_var(x, requires_grad=True):
 
 def adjust_learning_rate(optimizer, epoch):
     """根据epoch调整学习率"""
-    lr = 0.1  # 初始学习率
+    lr = 0.001  # 初始学习率
     if epoch >= 80:
         lr = lr * 0.1
     if epoch >= 90:
@@ -63,14 +64,14 @@ def train_mwnet(model, vnet, train_loader, meta_loader, val_loader, test_loader,
     model.to(device)
     vnet.to(device)
     
-    # 定义优化器 - 使用论文中的参数
-    optimizer_model = optim.SGD(model.parameters(), 
-                               lr=0.1,  # 初始学习率为0.1
+    # 定义优化器 - 使用论文中的参数并使用model.params()
+    optimizer_model = optim.SGD(model.params(), 
+                               lr=0.001,  # 初始学习率为0.001
                                momentum=0.9, 
                                weight_decay=5e-4)
     
-    # 使用vnet.parameters()而不是vnet.params()
-    optimizer_vnet = optim.Adam(vnet.parameters(), 
+    # 使用vnet.params()而不是vnet.parameters()
+    optimizer_vnet = optim.Adam(vnet.params(), 
                               lr=1e-3,  # 调整为MW-Net原始实现中的学习率
                               weight_decay=1e-4)
     
@@ -81,6 +82,15 @@ def train_mwnet(model, vnet, train_loader, meta_loader, val_loader, test_loader,
     train_losses = []
     meta_losses = []
     learning_rates = []
+    val_losses = []
+    
+    # 早停参数
+    best_val_metric = 0.0  # 使用验证集G-mean作为早停指标
+    best_model_wts = copy.deepcopy(model.state_dict())
+    best_vnet_wts = copy.deepcopy(vnet.state_dict())
+    patience = config['patience']
+    counter = 0
+    early_stopped = False
     
     print(f"开始使用MW-Net训练 {config['model_type']} 模型 - 数据集: {config['dataset_name']}, 不平衡率: {config['rho']}")
     
@@ -124,7 +134,7 @@ def train_mwnet(model, vnet, train_loader, meta_loader, val_loader, test_loader,
             targets = targets.to(device)
             
             # 步骤1: 创建元模型并加载当前模型的状态
-            meta_model = ResNet32_1d(input_channels=config['input_channels'], 
+            meta_model = MetaResNet32_1d(input_channels=config['input_channels'], 
                                     seq_length=config['seq_length'], 
                                     num_classes=2).to(device)
             meta_model.load_state_dict(model.state_dict())
@@ -144,14 +154,13 @@ def train_mwnet(model, vnet, train_loader, meta_loader, val_loader, test_loader,
             
             # 步骤6: 计算元梯度
             meta_model.zero_grad()
-            grads = torch.autograd.grad(l_f_meta, meta_model.parameters(), create_graph=True)
+            grads = torch.autograd.grad(l_f_meta, meta_model.params(), create_graph=True)
             
-            # 步骤7: 使用元梯度更新元模型参数
+            # 步骤7: 使用MW-Net原始实现的方式更新元模型参数
             meta_lr = current_lr
-            # 使用update_params方法替代手动更新
             meta_model.update_params(lr_inner=meta_lr, source_params=grads)
-            del grads
-            
+            del grads  # 清理梯度以节省内存
+
             # 步骤8: 获取元数据集批次
             try:
                 meta_inputs, meta_targets = next(meta_loader_iter)
@@ -232,33 +241,56 @@ def train_mwnet(model, vnet, train_loader, meta_loader, val_loader, test_loader,
         
         print(f"Epoch {epoch} - 训练损失: {epoch_loss:.4f}, 元损失: {epoch_meta_loss:.4f}, 学习率: {current_lr:.6f}")
         
-        # 在验证集上评估
+        # 每个epoch都在验证集上评估
         print(f"\n===== 在验证集上评估 Epoch {epoch} =====")
         val_metrics = evaluate_model(
             model, 
             val_loader, 
-            save_dir=None,
+            save_dir=None,  # 不保存验证集的混淆矩阵
             dataset_name=config['dataset_name'],
             rho=config['rho'],
             dataset_obj=dataset_obj,
             run_number=config['run_number'],
             model_type=config['model_type'],
-            is_validation=True
+            is_validation=True  # 标记这是验证集评估
         )
         
-        # 在测试集上定期评估
+        val_losses.append(val_metrics['g_mean'])  # 使用G-mean作为监控指标
+        
+        # 早停检查
+        current_val_metric = val_metrics['g_mean']
+        if current_val_metric > best_val_metric:
+            print(f"验证集G-mean提升: {best_val_metric:.4f} -> {current_val_metric:.4f}")
+            best_val_metric = current_val_metric
+            best_model_wts = copy.deepcopy(model.state_dict())
+            best_vnet_wts = copy.deepcopy(vnet.state_dict())
+            counter = 0
+        else:
+            counter += 1
+            print(f"验证集G-mean未提升, 当前耐心: {counter}/{patience}")
+            if counter >= patience:
+                print(f"早停触发! 已连续 {patience} 个epoch未见改善")
+                early_stopped = True
+                break
+        
+        # 在测试集上定期评估，但不保存混淆矩阵
         if epoch % config['eval_interval'] == 0 or epoch == config['epochs']:
             print(f"\n===== 在测试集上评估 Epoch {epoch}/{config['epochs']} =====")
             metrics = evaluate_model(
                 model, 
                 test_loader, 
-                save_dir=None,
+                save_dir=None,  # 中间评估不保存混淆矩阵
                 dataset_name=config['dataset_name'],
                 rho=config['rho'],
                 dataset_obj=dataset_obj,
                 run_number=config['run_number'],
                 model_type=config['model_type']
             )
+    
+    # 加载最佳模型权重
+    model.load_state_dict(best_model_wts)
+    vnet.load_state_dict(best_vnet_wts)
+    print(f"\n训练{'已提前结束' if early_stopped else '已完成'}, 使用验证集上最佳性能的模型")
     
     # 保存最终模型
     model_filename = f"{config['dataset_name']}_{config['model_type']}_mwnet_rho{config['rho']}_run{config['run_number']}.pth"
@@ -290,14 +322,13 @@ def main():
     parser.add_argument('--eval_interval', type=int, default=5, help='测试集评估间隔(每多少个epoch评估一次)')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--gpu', type=int, default=0, help='GPU ID，设为-1表示使用CPU')
+    parser.add_argument('--patience', type=int, default=10, help='早停耐心值，连续多少个epoch无改善后停止')
     
     # 保存参数
     parser.add_argument('--save_dir', type=str, default='./results', help='结果保存目录')
     
     args = parser.parse_args()
     
-    # 设置随机种子
-    set_seed(args.seed)
     
     # 设置设备
     if args.gpu >= 0 and torch.cuda.is_available():
@@ -338,18 +369,21 @@ def main():
         input_channels = 1
         seq_length = 28  # MNIST的图像大小
     
-    # 运行两次实验
-    for run_number in range(1, 3):
+    # 运行十次实验
+    for run_number in range(1, 11):
         print(f"\n{'='*50}")
         print(f"开始使用MW-Net训练 ResNet32_1d 模型在 {args.dataset} 数据集上 (第 {run_number} 次运行)")
         print(f"{'='*50}\n")
         
+        current_seed = args.seed + run_number
+        # 设置随机种子
+        set_seed(current_seed)
         # 创建配置字典
         config = {
             'dataset_name': args.dataset,
             'rho': args.rho,
             'batch_size': args.batch_size,
-            'model_type': 'ResNet32_1d',
+            'model_type': 'MetaResNet32_1d',  # 修改模型类型名称
             'epochs': args.epochs,
             'eval_interval': args.eval_interval,
             'seed': args.seed,
@@ -357,12 +391,13 @@ def main():
             'save_dir': args.save_dir,
             'run_number': run_number,
             'input_channels': input_channels,
-            'seq_length': seq_length
+            'seq_length': seq_length,
+            'patience': args.patience  # 添加早停耐心值
         }
         
-        # 创建模型
-        model = ResNet32_1d(input_channels=input_channels, seq_length=seq_length, num_classes=2)
-        vnet = VNet(1, 100, 1).to(device)  # 确保VNet也移动到正确的设备上
+        # 创建模型 - 使用MetaResNet32_1d替代ResNet32_1d
+        model = MetaResNet32_1d(input_channels=input_channels, seq_length=seq_length, num_classes=2)
+        vnet = VNet(1, 100, 1).to(device)
         
         # 训练模型
         print("\n开始MW-Net训练过程...")
@@ -376,18 +411,18 @@ def main():
         training_time = time.time() - start_time
         print(f"\nMW-Net训练完成! 总用时: {training_time:.2f} 秒")
         
-        # 最终评估
+        # 最终评估 - 只在这里保存混淆矩阵
         print("\n进行最终评估...")
         metrics = evaluate_model(
             trained_model, 
             test_loader, 
-            save_dir=config['save_dir'],
+            save_dir=config['save_dir'],  # 只在最终评估保存混淆矩阵
             dataset_name=config['dataset_name'],
             rho=config['rho'],
             dataset_obj=dataset,
             run_number=config['run_number'],
             model_type=f"{config['model_type']}_mwnet",
-            is_final=True
+            is_final=True  # 标记这是最终评估
         )
         
         print("\n===== 最终评估结果 =====")
@@ -407,4 +442,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-# python /workspace/RL/Comparison-MW_net/main.py --dataset TBM_K_M_Noise --rho 0.01 --batch_size 64 --val_ratio 0.2 --meta_ratio 0.1 --epochs 100 --save_dir /workspace/RL/Comparison-MW_net/results
+# python /workspace/RL/Comparison-MW_net/main.py --dataset TBM_K_M_Noise --rho 0.01 --batch_size 64 --val_ratio 0.2 --meta_ratio 0.1 --epochs 100 --patience 10 --save_dir /workspace/RL/Comparison-MW_net/results
